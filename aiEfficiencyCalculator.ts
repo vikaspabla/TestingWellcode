@@ -16,7 +16,7 @@ export async function calculateAIEfficiencyImpact(prId: string): Promise<AIEffic
   const aiSuggestions = await prisma.aISuggestion.findMany({
     where: { pullRequestId: prId }
   });
-  
+  //KAKAK
 
   if (!pullRequest) {
     throw new Error(`Pull request with ID ${prId} not found`);
