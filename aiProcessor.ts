@@ -4,6 +4,8 @@ import axios from 'axios';
 import { prisma } from '@/utils/prisma';
 import { getOpenAIKey } from '@/utils/config';
 
+
+
 // Initialize OpenAI client
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
