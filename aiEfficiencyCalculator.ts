@@ -11,6 +11,7 @@ export async function calculateAIEfficiencyImpact(prId: string): Promise<AIEffic
   const pullRequest = await prisma.pullRequest.findUnique({
     where: { id: prId }
   });
+  //
 
   const aiSuggestions = await prisma.aISuggestion.findMany({
     where: { pullRequestId: prId }
