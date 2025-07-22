@@ -16,6 +16,8 @@ export async function calculateAIEfficiencyImpact(prId: string): Promise<AIEffic
     where: { pullRequestId: prId }
   });
 
+  
+
   if (!pullRequest) {
     throw new Error(`Pull request with ID ${prId} not found`);
   }
