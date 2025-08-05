@@ -201,6 +201,7 @@ async function analyzeSentiment(files: any[]): Promise<number> {
     return fallbackAnalyzeSentiment(commentText);
   } catch (error) {
     console.error('Error analyzing sentiment:', error);
-    
+
     return 0.5; // Neutral sentiment on error
+    
   }
