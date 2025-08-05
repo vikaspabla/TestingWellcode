@@ -1,0 +1,205 @@
+import { AccountType, CodeAnalysisResult, CodeFeedback } from '@/models/types';
+import OpenAI from 'openai';
+import axios from 'axios';
+import { prisma } from '@/utils/prisma';
+import { getOpenAIKey } from '@/utils/config';
+
+
+
+// Initialize OpenAI client
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+// Initialize HuggingFace client config
+const huggingfaceEndpoint = 'https://api-inference.huggingface.co/models/';
+const huggingfaceToken = process.env.HUGGINGFACE_API_KEY;
+
+// Maximum length for text analysis to avoid token limits (512 tokens ≈ 2048 characters)
+const MAX_ANALYSIS_LENGTH = 2048;
+
+// IMPORTANT: Define all model endpoints here to ensure consistency
+const SENTIMENT_MODEL = 'cardiffnlp/twitter-roberta-base-sentiment-latest';
+const TOXICITY_MODEL = 'martin-ha/toxic-comment-model';
+
+// List of legacy model endpoints to avoid using (for error checking)
+const LEGACY_MODELS = [
+  'distilbert-base-uncased-finetuned-sst-2-english'
+];
+
+export interface ComplexityAnalysis {
+  technicalComplexity: number;  // 0-1: How complex are the changes technically
+  scopeComplexity: number;      // 0-1: How broad is the scope of changes
+  riskLevel: number;           // 0-1: Potential impact/risk of changes
+  contextNeeded: number;       // 0-1: How much context is needed to review
+  testingComplexity: number;   // 0-1: Complexity of testing requirements
+  explanation: string;         // AI's explanation of the analysis
+}
+
+export interface AnalysisContext {
+  files: {
+    path: string;
+    diff: string;
+    previousContent?: string;
+  }[];
+  description?: string;
+  comments?: string[];
+  reviews?: string[];
+}
+
+/**
+ * Analyze code patterns in files
+ * @param files Files changed in the PR
+ * @param accountType Type of account (ORGANIZATION or PERSONAL)
+ * @returns Analysis results
+ */
+export async function analyzeCode(files: any[], accountType: AccountType): Promise<CodeAnalysisResult> {
+  try {
+    console.log(`analyzeCode called with ${files.length} files for account type: ${accountType}`);
+    
+    // Log each filename for debugging
+    files.forEach((file, index) => {
+      console.log(`File ${index + 1}: ${file.filename}, additions: ${file.additions}, deletions: ${file.deletions}`);
+    });
+    
+    // Log the request for billing/monitoring
+    await logAIRequest('openai', 'code_analysis', calculateInputSize(files));
+    
+    // Filter out non-code files
+    const codeFiles = files.filter(file => isCodeFile(file.filename));
+    console.log(`After filtering: ${codeFiles.length} code files to analyze`);
+    
+    // Skip analysis if no code files
+    if (codeFiles.length === 0) {
+      console.log('No code files to analyze, skipping OpenAI call');
+      return {
+        feedback: [],
+        score: 100,
+      };
+    }
+    
+    // For personal accounts, use a more focused and lighter analysis
+    const analysisPrompt = accountType === AccountType.PERSONAL
+      ? generatePersonalAnalysisPrompt(codeFiles)
+      : generateOrganizationAnalysisPrompt(codeFiles);
+    
+    console.log(`Generated analysis prompt (${analysisPrompt.length} chars), calling OpenAI API with model: gpt-4o-mini-2024-07-18`);
+    
+    // Use OpenAI for code pattern detection
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini-2024-07-18", // Switched to gpt-4o-mini for better quota limits and cost efficiency
+      messages: [
+        { role: "system", content: "You are a code review assistant that provides constructive feedback on code patterns and quality. Return your analysis as a JSON array of feedback items." },
+        { role: "user", content: analysisPrompt }
+      ],
+      max_tokens: 1000,
+      temperature: 0.3,
+      response_format: { type: "json_object" }, // Enforce JSON format
+    });
+    
+    console.log(`Received OpenAI response, tokens used: ${response.usage?.total_tokens || 'unknown'}`);
+    
+    // Parse the response
+    const analysis = parseAIResponse(response.choices[0].message?.content || '');
+    console.log(`Parsed analysis with ${analysis.feedback.length} feedback items and score: ${analysis.score}`);
+    
+    // Analyze sentiment if there are comments (for organizations only)
+    if (accountType === AccountType.ORGANIZATION) {
+      analysis.sentimentScore = await analyzeSentiment(files);
+    }
+    
+    return analysis;
+  } catch (error) {
+    console.error('Error analyzing code:', error);
+    
+    // Return empty analysis on error
+    return {
+      feedback: [
+        {
+          type: 'error',
+          message: 'Failed to analyze code patterns. Please try again later.',
+          codeContext: null,
+          fileLocation: null
+        }
+      ],
+      score: 0,
+    };
+  }
+}
+
+/**
+ * Analyze sentiment of comments
+ * @param files Files with potential comments
+ * @returns Sentiment score
+ */
+async function analyzeSentiment(files: any[]): Promise<number> {
+  try {
+    // Extract comments from code
+    const comments = extractComments(files);
+    
+    if (comments.length === 0) {
+      return 0.5; // Return neutral score for no comments
+    }
+    
+    // Log the request for billing/monitoring
+    await logAIRequest('huggingface', 'sentiment_analysis', calculateStringSize(comments.join(' ')));
+    
+    // Safety check to verify we're not using a legacy model endpoint
+    if (LEGACY_MODELS.some(model => `${huggingfaceEndpoint}${model}`.includes('distilbert-base-uncased-finetuned-sst-2-english'))) {
+      console.warn('Attempt to use legacy model detected - falling back to backup analysis');
+      // Fall back to local sentiment analysis instead of throwing error
+      return fallbackAnalyzeSentiment(comments.join('\n'));
+    }
+    
+    // Chunk the comments if they exceed token limits
+    const commentText = comments.join('\n');
+    const chunks = chunkText(commentText, MAX_ANALYSIS_LENGTH);
+    let totalScore = 0;
+    let validChunks = 0;
+    
+    console.log(`Analyzing sentiment of ${chunks.length} text chunks using model: ${SENTIMENT_MODEL}`);
+    
+    // Process each chunk and average the results
+    for (const chunk of chunks) {
+      try {
+        // Use HuggingFace for sentiment analysis with explicit model name
+        const response = await axios.post(
+          `${huggingfaceEndpoint}${SENTIMENT_MODEL}`,
+          { inputs: chunk },
+          {
+            headers: {
+              'Authorization': `Bearer ${huggingfaceToken}`,
+              'Content-Type': 'application/json',
+            },
+            timeout: 10000, // Increase timeout for reliability
+          }
+        );
+        
+        // Parse the sentiment scores - updated for the model's output format
+        if (Array.isArray(response.data) && response.data.length > 0) {
+          const scores = response.data[0];
+          // New model returns scores for negative (0), neutral (1), and positive (2)
+          const positiveScore = scores.find((s: any) => s.label === '2')?.score || 0;
+          const neutralScore = scores.find((s: any) => s.label === '1')?.score || 0;
+          
+          // Calculate weighted score (0-1 range)
+          const weightedScore = positiveScore + (neutralScore * 0.5);
+          totalScore += weightedScore;
+          validChunks++;
+        }
+      } catch (chunkError: any) {
+        console.warn(`Error analyzing sentiment chunk: ${chunkError?.message || 'Unknown error'}`);
+        // Continue with other chunks on error
+      }
+    }
+    
+    if (validChunks > 0) {
+      return totalScore / validChunks;
+    }
+    
+    // Fall back to simpler analysis if all API calls failed
+    return fallbackAnalyzeSentiment(commentText);
+  } catch (error) {
+    console.error('Error analyzing sentiment:', error);
+    return 0.5; // Neutral sentiment on error
+  }
